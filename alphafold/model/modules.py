@@ -410,6 +410,141 @@ class AlphaFold(hk.Module):
       del (ret[0] if compute_loss else ret)['representations']  # pytype: disable=unsupported-operands
     return ret
 
+  def predict_multiseed(
+      self,
+      batch,
+      is_training,
+      batched_prev,
+      ensemble_representations=False,
+      return_representations=False,
+      shard_size=1,
+  ):
+    """Run predictions for multiple initial latent sets in parallel via vmap.
+
+    Applies vmap over the Evoformer (pairformer) and StructureModule so that
+    each set of pre-generated initial latents (prev_pos, prev_msa_first_row,
+    prev_pair) produces an independent structure prediction.  This enables
+    diverse sampling by starting the recycling trajectory from different points
+    in latent space.
+
+    Use :func:`make_empty_prev` to create a suitable zero-initialised
+    ``batched_prev`` dict.
+
+    Args:
+      batch: Dictionary with inputs to the AlphaFold model (same as __call__).
+      is_training: Whether the system is in training or inference mode.
+      batched_prev: Dict of stacked initial latents with a leading seed
+        dimension [N_seeds, ...]:
+          'prev_pos': [N_seeds, N_res, atom_type_num, 3]
+          'prev_msa_first_row': [N_seeds, N_res, msa_channel]
+          'prev_pair': [N_seeds, N_res, N_res, pair_channel]
+      ensemble_representations: Whether to use ensembling of representations.
+      return_representations: Whether to return intermediate representations.
+      shard_size: Shard size for sharded vmap.  Use 1 for the lowest memory
+        footprint (sequential execution), or a larger value (up to N_seeds)
+        for more parallelism at the cost of memory.
+
+    Returns:
+      Batched model outputs with a leading N_seeds dimension.  Each leaf array
+      has shape [N_seeds, ...] where ... matches the shape returned by a
+      single forward pass.
+    """
+    impl = AlphaFoldIteration(self.config, self.global_config)
+
+    def get_prev(ret):
+      new_prev = {
+          'prev_pos': ret['structure_module']['final_atom_positions'],
+          'prev_msa_first_row': ret['representations']['msa_first_row'],
+          'prev_pair': ret['representations']['pair'],
+      }
+      return jax.tree.map(jax.lax.stop_gradient, new_prev)
+
+    def do_call(prev, recycle_idx):
+      # For predict_multiseed the batch is not pre-stacked with recycling copies
+      # (unlike AlphaFold.__call__ when resample_msa_in_recycling=True), so we
+      # always use the full batch as the ensembled_batch without dividing by
+      # (num_recycle + 1).
+      ensembled_batch = batch
+      non_ensembled_batch = jax.tree.map(lambda x: x, prev)
+
+      return impl(
+          ensembled_batch=ensembled_batch,
+          non_ensembled_batch=non_ensembled_batch,
+          is_training=is_training,
+          compute_loss=False,
+          ensemble_representations=ensemble_representations,
+      )
+
+    def single_seed_forward(prev):
+      """Run one complete forward pass starting from the given initial latents."""
+      if self.config.num_recycle:
+        if 'num_iter_recycling' in batch:
+          # Training time: num_iter_recycling is in batch.
+          num_iter = batch['num_iter_recycling'][0]
+          num_iter = jnp.minimum(num_iter, self.config.num_recycle)
+        else:
+          # Eval mode or tests: use the maximum number of iterations.
+          num_iter = self.config.num_recycle
+
+        def body(args):
+          recycle_idx, prev = args
+          return recycle_idx + 1, get_prev(do_call(prev, recycle_idx=recycle_idx))
+
+        if hk.running_init():
+          # When initialising the Haiku module, run one iteration to
+          # initialise all sub-modules used inside the loop.
+          _, prev_out = body((0, prev))
+        else:
+          _, prev_out = hk.while_loop(
+              lambda x: x[0] < num_iter, body, (0, prev)
+          )
+      else:
+        num_iter = 0
+        prev_out = prev
+
+      ret = do_call(prev=prev_out, recycle_idx=num_iter)
+
+      if not return_representations:
+        del ret['representations']
+      return ret
+
+    return mapping.sharded_map(
+        single_seed_forward, shard_size=shard_size, in_axes=0, out_axes=0
+    )(batched_prev)
+
+
+def make_empty_prev(emb_config, num_residues, num_seeds=1):
+  """Creates zero-initialised recycling latents for :meth:`AlphaFold.predict_multiseed`.
+
+  Returns a ``batched_prev`` dict suitable for passing directly to
+  :meth:`AlphaFold.predict_multiseed`.  Latents that are disabled by the
+  config are omitted from the returned dict.
+
+  Args:
+    emb_config: The ``embeddings_and_evoformer`` sub-config from the model
+      config (i.e. ``config.model.embeddings_and_evoformer``).
+    num_residues: Number of residues in the sequence.
+    num_seeds: Number of independent seeds (leading batch dimension).
+
+  Returns:
+    Dict with zero-valued arrays for whichever of 'prev_pos',
+    'prev_msa_first_row', and 'prev_pair' are enabled in ``emb_config``.
+    Each array has shape [num_seeds, num_residues, ...].
+  """
+  prev = {}
+  if emb_config.recycle_pos:
+    prev['prev_pos'] = jnp.zeros(
+        [num_seeds, num_residues, residue_constants.atom_type_num, 3]
+    )
+  if emb_config.recycle_features:
+    prev['prev_msa_first_row'] = jnp.zeros(
+        [num_seeds, num_residues, emb_config.msa_channel]
+    )
+    prev['prev_pair'] = jnp.zeros(
+        [num_seeds, num_residues, num_residues, emb_config.pair_channel]
+    )
+  return prev
+
 
 class TemplatePairStack(hk.Module):
   """Pair stack for the templates.

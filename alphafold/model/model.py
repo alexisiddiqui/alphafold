@@ -87,6 +87,15 @@ class RunModel:
         model = modules_multimer.AlphaFold(self.config.model)
         return model(batch, is_training=False)
 
+      def _forward_fn_multiseed(batch, batched_prev, shard_size):
+        model = modules_multimer.AlphaFold(self.config.model)
+        return model.predict_multiseed(
+            batch,
+            is_training=False,
+            batched_prev=batched_prev,
+            shard_size=shard_size,
+        )
+
     else:
 
       def _forward_fn(batch):
@@ -97,6 +106,21 @@ class RunModel:
             compute_loss=False,
             ensemble_representations=True,
         )
+
+      def _forward_fn_multiseed(batch, batched_prev, shard_size):
+        model = modules.AlphaFold(self.config.model)
+        return model.predict_multiseed(
+            batch,
+            is_training=False,
+            batched_prev=batched_prev,
+            ensemble_representations=True,
+            shard_size=shard_size,
+        )
+
+    self.apply_multiseed = jax.jit(
+        hk.transform(_forward_fn_multiseed).apply,
+        static_argnames=('shard_size',),
+    )
 
     self.apply = jax.jit(hk.transform(_forward_fn).apply)
     self.init = jax.jit(hk.transform(_forward_fn).init)
@@ -180,5 +204,58 @@ class RunModel:
     result.update(
         get_confidence_metrics(result, multimer_mode=self.multimer_mode)
     )
+    logging.info('Output shape was %s', tree.map(lambda x: x.shape, result))
+    return result
+
+  def predict_multiseed(
+      self,
+      feat: features.FeatureDict,
+      batched_prev: Mapping[str, Any],
+      random_seed: int,
+      shard_size: int = 1,
+  ) -> Mapping[str, Any]:
+    """Makes predictions for multiple initial latent sets in parallel.
+
+    Vmaps the Evoformer (pairformer) and StructureModule over a batch of
+    pre-generated initial latents, enabling diverse structure prediction by
+    starting the recycling trajectory from different points in latent space.
+    Supported for both monomer and multimer models.
+
+    Use :func:`~alphafold.model.modules.make_empty_prev` to construct
+    zero-initialised starting latents of the correct shape and dtype.
+
+    For the multimer model, the recycling loop always runs exactly
+    ``num_recycle`` steps (no early-stop CA-distance criterion) and MSA is
+    not resampled between steps so that vmap can be applied uniformly.
+
+    Args:
+      feat: A dictionary of NumPy feature arrays as output by
+        RunModel.process_features.
+      batched_prev: Dict of stacked initial latents with a leading seed
+        dimension [N_seeds, ...].  Keys: 'prev_pos', 'prev_msa_first_row',
+        'prev_pair' (subset determined by the model config).
+      random_seed: The random seed to use when running the model.
+      shard_size: Shard size for the sharded vmap.  Use 1 for the lowest
+        memory footprint (sequential), or a larger value (up to N_seeds) for
+        more parallelism at the cost of memory.
+
+    Returns:
+      A dictionary of model outputs with a leading N_seeds dimension.
+    """
+    self.init_params(feat)
+    logging.info(
+        'Running predict_multiseed with shape(feat) = %s, '
+        'shape(batched_prev) = %s',
+        tree.map(lambda x: x.shape, feat),
+        tree.map(lambda x: x.shape, batched_prev),
+    )
+    result = self.apply_multiseed(
+        self.params,
+        jax.random.PRNGKey(random_seed),
+        feat,
+        batched_prev,
+        shard_size=shard_size,
+    )
+    tree.map(lambda x: x.block_until_ready(), result)
     logging.info('Output shape was %s', tree.map(lambda x: x.shape, result))
     return result

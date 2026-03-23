@@ -29,6 +29,7 @@ from alphafold.model import common_modules
 from alphafold.model import folding_multimer
 from alphafold.model import geometry
 from alphafold.model import layer_stack
+from alphafold.model import mapping
 from alphafold.model import modules
 from alphafold.model import prng
 from alphafold.model import utils
@@ -535,6 +536,135 @@ class AlphaFold(hk.Module):
 
     return ret
 
+  def predict_multiseed(
+      self,
+      batch,
+      is_training,
+      batched_prev,
+      return_representations=False,
+      shard_size=1,
+      safe_key=None,
+  ):
+    """Run predictions for multiple initial latent sets in parallel via vmap.
+
+    Applies vmap over the Evoformer (pairformer) and StructureModule so that
+    each set of pre-generated initial latents (prev_pos, prev_msa_first_row,
+    prev_pair) produces an independent structure prediction.  This enables
+    diverse sampling by starting the recycling trajectory from different points
+    in latent space without running separate forward passes serially.
+
+    Use :func:`alphafold.model.modules.make_empty_prev` to create suitable
+    zero-initialised ``batched_prev`` dicts.
+
+    Unlike :meth:`__call__`, the recycling loop in this method always runs
+    exactly ``num_recycle`` iterations (no early-stop CA-distance criterion),
+    and MSA is not resampled between recycling steps.  This keeps the
+    computation graph uniform across seeds so that vmap can be applied.
+
+    The StructureModule head always runs in the multimer model (it only needs
+    ``aatype`` and ``seq_mask`` from ``batch``).  The optional
+    ``all_atom_positions`` key only controls whether the structure-module
+    output is used to update representations for the confidence heads.
+
+    Args:
+      batch: Dictionary with inputs to the AlphaFold-Multimer model (same
+        format as :meth:`__call__`).  Recycling keys (``prev_pos``,
+        ``prev_msa_first_row``, ``prev_pair``) are ignored and overridden by
+        ``batched_prev``.
+      is_training: Whether the system is in training or inference mode.
+      batched_prev: Dict of stacked initial latents with a leading seed
+        dimension [N_seeds, ...]:
+          'prev_pos': [N_seeds, N_res, atom_type_num, 3]
+          'prev_msa_first_row': [N_seeds, N_res, msa_channel]
+          'prev_pair': [N_seeds, N_res, N_res, pair_channel]
+        (Subset determined by the model config; use
+        :func:`alphafold.model.modules.make_empty_prev` to build this dict.)
+      return_representations: Whether to include intermediate representations
+        in the returned dict.
+      shard_size: Shard size for sharded vmap.  Use 1 for the lowest memory
+        footprint (sequential execution), or a larger value (up to N_seeds)
+        for more parallelism at the cost of memory.
+      safe_key: Optional :class:`prng.SafeKey` or raw JAX PRNGKey.  If
+        ``None`` a key is obtained from Haiku's RNG state.
+
+    Returns:
+      Batched model outputs with a leading N_seeds dimension.  Each leaf array
+      has shape [N_seeds, ...] where ... matches the shape returned by a
+      single forward pass.
+    """
+    c = self.config
+    impl = AlphaFoldIteration(c, self.global_config)
+
+    if safe_key is None:
+      safe_key = prng.SafeKey(hk.next_rng_key())
+    elif isinstance(safe_key, jnp.ndarray):
+      safe_key = prng.SafeKey(safe_key)
+
+    # Ensure batch elements are JAX arrays (not raw numpy arrays).
+    # AlphaFoldIteration.__call__ uses hk.eval_shape internally, which creates
+    # an inner JIT trace.  If batch values are concrete numpy arrays and the
+    # inner JIT produces traced indices (e.g. from sample_msa), indexing a
+    # numpy array with a JAX tracer calls __array__ on the tracer and fails.
+    # Converting to JAX arrays upfront ensures dynamic indexing works correctly.
+    batch = jax.tree.map(jnp.asarray, batch)
+
+    # Capture the underlying key array once.  Each call to apply_network
+    # creates a fresh SafeKey Python object from the same array so that the
+    # SafeKey._used Python-level guard never triggers.  At is_training=False
+    # dropout is disabled, so reusing the same key for every seed is safe.
+    key_val = safe_key.get()
+
+    def get_prev(ret):
+      """Extract recycling latents from a forward-pass result."""
+      new_prev = {
+          'prev_pos': ret['structure_module']['final_atom_positions'],
+          'prev_msa_first_row': ret['representations']['msa_first_row'],
+          'prev_pair': ret['representations']['pair'],
+      }
+      return jax.tree.map(jax.lax.stop_gradient, new_prev)
+
+    def apply_network(prev):
+      recycled_batch = {**batch, **prev}
+      return impl(
+          batch=recycled_batch,
+          is_training=is_training,
+          safe_key=prng.SafeKey(key_val),
+      )
+
+    def single_seed_forward(prev):
+      """Run one complete forward pass starting from the given initial latents."""
+      if c.num_recycle:
+        if 'num_iter_recycling' in batch:
+          # Training time: num_iter_recycling is in batch.
+          num_iter = batch['num_iter_recycling'][0]
+          num_iter = jnp.minimum(num_iter, c.num_recycle)
+        else:
+          # Eval mode or tests: use the maximum number of iterations.
+          num_iter = c.num_recycle
+
+        def body(args):
+          recycle_idx, prev = args
+          return recycle_idx + 1, get_prev(apply_network(prev))
+
+        if hk.running_init():
+          # Run one iteration to initialise all sub-modules.
+          _, prev_out = body((0, prev))
+        else:
+          _, prev_out = hk.while_loop(
+              lambda x: x[0] < num_iter, body, (0, prev)
+          )
+      else:
+        prev_out = prev
+
+      ret = apply_network(prev_out)
+
+      if not return_representations:
+        del ret['representations']
+      return ret
+
+    return mapping.sharded_map(
+        single_seed_forward, shard_size=shard_size, in_axes=0, out_axes=0
+    )(batched_prev)
 
 class EmbeddingsAndEvoformer(hk.Module):
   """Embeds the input data and runs Evoformer.
