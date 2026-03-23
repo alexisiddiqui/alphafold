@@ -508,10 +508,9 @@ class AlphaFold(hk.Module):
         del ret['representations']
       return ret
 
-    batched_forward = mapping.sharded_map(
+    return mapping.sharded_map(
         single_seed_forward, shard_size=shard_size, in_axes=0, out_axes=0
-    )
-    return batched_forward(batched_prev)
+    )(batched_prev)
 
 
 def make_empty_prev(emb_config, num_residues, num_seeds=1):

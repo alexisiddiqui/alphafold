@@ -662,10 +662,9 @@ class AlphaFold(hk.Module):
         del ret['representations']
       return ret
 
-    batched_forward = mapping.sharded_map(
+    return mapping.sharded_map(
         single_seed_forward, shard_size=shard_size, in_axes=0, out_axes=0
-    )
-    return batched_forward(batched_prev)
+    )(batched_prev)
 
 class EmbeddingsAndEvoformer(hk.Module):
   """Embeds the input data and runs Evoformer.
