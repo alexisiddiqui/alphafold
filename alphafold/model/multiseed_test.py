@@ -19,6 +19,7 @@ from absl.testing import parameterized
 from alphafold.common import residue_constants
 from alphafold.model import config as model_config
 from alphafold.model import modules
+from alphafold.model import modules_multimer
 import haiku as hk
 import jax
 import jax.numpy as jnp
@@ -229,6 +230,159 @@ class PredictMultiseedTest(parameterized.TestCase):
     result = self._run_predict_multiseed(num_seeds=2, shard_size=1, num_recycle=1)
     self.assertIn('structure_module', result)
     self.assertEqual(result['structure_module']['final_atom_positions'].shape[0], 2)
+
+
+# ---------------------------------------------------------------------------
+# AlphaFold-Multimer tests
+# ---------------------------------------------------------------------------
+
+
+def _get_small_multimer_config(num_recycle=0):
+  """Returns a tiny AlphaFold-Multimer config for fast unit tests."""
+  cfg = model_config.model_config('model_1_multimer_v3')
+  c = cfg.model
+  # Minimise computation.
+  c.embeddings_and_evoformer.evoformer_num_block = 1
+  c.embeddings_and_evoformer.extra_msa_stack_num_block = 1
+  c.embeddings_and_evoformer.template.enabled = False
+  # Use very small MSA sizes so the test is fast.
+  c.embeddings_and_evoformer.num_msa = 4
+  c.embeddings_and_evoformer.num_extra_msa = 4
+  c.num_recycle = num_recycle
+  c.heads.masked_msa.weight = 0.0
+  c.heads.distogram.weight = 0.0
+  c.heads.predicted_lddt.weight = 0.0
+  c.heads.predicted_aligned_error.weight = 0.0
+  c.heads.experimentally_resolved.weight = 0.0
+  return cfg.model
+
+
+def _make_multimer_batch(num_residues, num_msa):
+  """Creates a minimal synthetic batch for the AlphaFold-Multimer model.
+
+  The multimer model takes a flat batch dict (no leading ensemble dim). MSA
+  sampling is performed internally in JAX, so the batch must contain raw MSA
+  arrays before sampling.
+
+  Includes dummy ``all_atom_positions`` so that the structure module output
+  is available to populate ``prev_pos`` during recycling.
+  """
+  cfg = _get_small_multimer_config()
+  emb_c = cfg.embeddings_and_evoformer
+  atom_type_num = residue_constants.atom_type_num  # 37
+
+  batch = {
+      # Sequence features.
+      'aatype': np.zeros([num_residues], dtype=np.int32),
+      'residue_index': np.arange(num_residues, dtype=np.int32),
+      'seq_mask': np.ones([num_residues], dtype=np.float32),
+      # MSA features: shape [N_msa, N_res] before internal sampling.
+      'msa': np.zeros([num_msa, num_residues], dtype=np.int32),
+      'msa_mask': np.ones([num_msa, num_residues], dtype=np.float32),
+      'deletion_matrix': np.zeros([num_msa, num_residues], dtype=np.float32),
+      # Extra MSA (= full MSA before sampling; sample_msa splits it).
+      'extra_msa': np.zeros([num_msa, num_residues], dtype=np.int32),
+      'extra_msa_mask': np.ones([num_msa, num_residues], dtype=np.float32),
+      'extra_deletion_matrix': np.zeros(
+          [num_msa, num_residues], dtype=np.float32
+      ),
+      # Chain / entity identity features used by relative position encoding.
+      'asym_id': np.zeros([num_residues], dtype=np.float32),
+      'entity_id': np.zeros([num_residues], dtype=np.float32),
+      'sym_id': np.zeros([num_residues], dtype=np.float32),
+      # Dummy ground-truth atoms – their presence as a key allows the
+      # structure module output to be used for representation updates.
+      'all_atom_positions': np.zeros(
+          [num_residues, atom_type_num, 3], dtype=np.float32
+      ),
+      'all_atom_mask': np.zeros([num_residues, atom_type_num], dtype=np.float32),
+      # Recycling placeholders overridden by batched_prev in predict_multiseed.
+      'prev_pos': np.zeros(
+          [num_residues, atom_type_num, 3], dtype=np.float32
+      ),
+      'prev_msa_first_row': np.zeros(
+          [num_residues, emb_c.msa_channel], dtype=np.float32
+      ),
+      'prev_pair': np.zeros(
+          [num_residues, num_residues, emb_c.pair_channel], dtype=np.float32
+      ),
+  }
+  return batch
+
+
+class MultiseedMultimerTest(parameterized.TestCase):
+  """Tests for modules_multimer.AlphaFold.predict_multiseed."""
+
+  def _run_predict_multiseed(self, num_seeds, shard_size, num_recycle=0):
+    num_residues = 5
+    num_msa = 8
+    cfg = _get_small_multimer_config(num_recycle=num_recycle)
+    emb_config = cfg.embeddings_and_evoformer
+
+    batch = _make_multimer_batch(num_residues, num_msa)
+    batched_prev = modules.make_empty_prev(emb_config, num_residues, num_seeds)
+
+    def forward(batch, batched_prev):
+      model = modules_multimer.AlphaFold(cfg)
+      return model.predict_multiseed(
+          batch,
+          is_training=False,
+          batched_prev=batched_prev,
+          shard_size=shard_size,
+      )
+
+    init, apply = hk.transform(forward).init, hk.transform(forward).apply
+    rng = jax.random.PRNGKey(0)
+    params = init(rng, batch, batched_prev)
+    result = apply(params, rng, batch, batched_prev)
+    return result
+
+  @parameterized.named_parameters(
+      ('seeds_1_shard_1', 1, 1),
+      ('seeds_2_shard_1', 2, 1),
+      ('seeds_2_shard_2', 2, 2),
+  )
+  def test_output_has_leading_seed_dim(self, num_seeds, shard_size):
+    result = self._run_predict_multiseed(num_seeds, shard_size)
+    final_atom_positions = result['structure_module']['final_atom_positions']
+    self.assertEqual(final_atom_positions.shape[0], num_seeds)
+
+  def test_output_shape_structure(self):
+    """Each seed should produce a complete set of model outputs."""
+    num_seeds = 2
+    num_residues = 5
+    result = self._run_predict_multiseed(num_seeds, shard_size=1)
+
+    sm = result['structure_module']
+    # final_atom_positions: [N_seeds, N_res, 37, 3]
+    self.assertEqual(
+        sm['final_atom_positions'].shape, (num_seeds, num_residues, 37, 3)
+    )
+    # final_atom_mask: [N_seeds, N_res, 37]
+    self.assertEqual(
+        sm['final_atom_mask'].shape, (num_seeds, num_residues, 37)
+    )
+
+  def test_shard_size_does_not_affect_output(self):
+    """Results should be identical regardless of shard_size."""
+    num_seeds = 2
+    result_shard1 = self._run_predict_multiseed(num_seeds, shard_size=1)
+    result_shardN = self._run_predict_multiseed(num_seeds, shard_size=num_seeds)
+
+    positions_shard1 = result_shard1['structure_module']['final_atom_positions']
+    positions_shardN = result_shardN['structure_module']['final_atom_positions']
+
+    np.testing.assert_allclose(
+        np.array(positions_shard1), np.array(positions_shardN), atol=1e-5
+    )
+
+  def test_num_recycle_no_error(self):
+    """predict_multiseed should work when num_recycle > 0."""
+    result = self._run_predict_multiseed(num_seeds=2, shard_size=1, num_recycle=1)
+    self.assertIn('structure_module', result)
+    self.assertEqual(
+        result['structure_module']['final_atom_positions'].shape[0], 2
+    )
 
 
 if __name__ == '__main__':

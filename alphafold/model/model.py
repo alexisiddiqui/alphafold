@@ -87,6 +87,15 @@ class RunModel:
         model = modules_multimer.AlphaFold(self.config.model)
         return model(batch, is_training=False)
 
+      def _forward_fn_multiseed(batch, batched_prev, shard_size):
+        model = modules_multimer.AlphaFold(self.config.model)
+        return model.predict_multiseed(
+            batch,
+            is_training=False,
+            batched_prev=batched_prev,
+            shard_size=shard_size,
+        )
+
     else:
 
       def _forward_fn(batch):
@@ -108,10 +117,10 @@ class RunModel:
             shard_size=shard_size,
         )
 
-      self.apply_multiseed = jax.jit(
-          hk.transform(_forward_fn_multiseed).apply,
-          static_argnames=('shard_size',),
-      )
+    self.apply_multiseed = jax.jit(
+        hk.transform(_forward_fn_multiseed).apply,
+        static_argnames=('shard_size',),
+    )
 
     self.apply = jax.jit(hk.transform(_forward_fn).apply)
     self.init = jax.jit(hk.transform(_forward_fn).init)
@@ -207,14 +216,17 @@ class RunModel:
   ) -> Mapping[str, Any]:
     """Makes predictions for multiple initial latent sets in parallel.
 
-    Runs :meth:`~alphafold.model.modules.AlphaFold.predict_multiseed` which
-    vmaps the Evoformer (pairformer) and StructureModule over a batch of
+    Vmaps the Evoformer (pairformer) and StructureModule over a batch of
     pre-generated initial latents, enabling diverse structure prediction by
     starting the recycling trajectory from different points in latent space.
+    Supported for both monomer and multimer models.
 
-    Only supported for the monomer model.  Use
-    :func:`~alphafold.model.modules.make_empty_prev` to construct
+    Use :func:`~alphafold.model.modules.make_empty_prev` to construct
     zero-initialised starting latents of the correct shape and dtype.
+
+    For the multimer model, the recycling loop always runs exactly
+    ``num_recycle`` steps (no early-stop CA-distance criterion) and MSA is
+    not resampled between steps so that vmap can be applied uniformly.
 
     Args:
       feat: A dictionary of NumPy feature arrays as output by
@@ -229,14 +241,7 @@ class RunModel:
 
     Returns:
       A dictionary of model outputs with a leading N_seeds dimension.
-
-    Raises:
-      AttributeError: If called on a multimer model instance.
     """
-    if self.multimer_mode:
-      raise AttributeError(
-          'predict_multiseed is only supported for monomer models.'
-      )
     self.init_params(feat)
     logging.info(
         'Running predict_multiseed with shape(feat) = %s, '
